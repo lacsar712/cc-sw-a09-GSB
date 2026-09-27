@@ -6,6 +6,7 @@ import { api } from '../api.js'
 const router = useRouter()
 const role = ref(localStorage.getItem('role') || '')
 const jobs = ref([])
+const prefixes = ref([])
 const err = ref('')
 const form = ref({ lamp: '', nominal_nm: 0.15, measured_nm: 0.15 })
 let timer
@@ -13,7 +14,9 @@ let timer
 async function refresh() {
   if (!localStorage.getItem('tok')) return
   try {
-    jobs.value = await api('/api/jobs')
+    const [jobList, p] = await Promise.all([api('/api/jobs'), api('/api/prefixes')])
+    jobs.value = jobList
+    prefixes.value = p.prefixes || []
     err.value = ''
   } catch (e) {
     err.value = String(e.message || e)
@@ -47,6 +50,15 @@ onUnmounted(() => clearInterval(timer))
     <p v-if="err" style="color:#b00020">{{ err }}</p>
     <section v-if="role === 'writer'" style="margin:16px 0; padding:12px; border:1px solid #ccc;">
       <h3>提交校准</h3>
+      <p class="prefix-hint">
+        合法前缀：
+        <template v-if="prefixes.length">
+          <b v-for="(p, i) in prefixes" :key="p">{{ i ? '、' : '' }}{{ p }}</b>
+        </template>
+        <b v-else>（前缀簿为空，任何称呼都会被拒收）</b>
+        ；称呼必须以任一前缀开头，否则拒收（见
+        <router-link to="/prefixes">前缀簿</router-link>）。
+      </p>
       <label>灯种 <input v-model="form.lamp" /></label>
       <label>标称 nm <input type="number" step="0.01" v-model.number="form.nominal_nm" /></label>
       <label>实测 nm <input type="number" step="0.01" v-model.number="form.measured_nm" /></label>
@@ -77,3 +89,10 @@ onUnmounted(() => clearInterval(timer))
     </table>
   </div>
 </template>
+
+<style scoped>
+.prefix-hint {
+  font-size: 13px;
+  color: #555;
+}
+</style>
