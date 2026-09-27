@@ -3,7 +3,7 @@ from datetime import datetime, timedelta, timezone
 
 import psycopg
 from jose import JWTError, jwt
-from litestar import Litestar, Request, get, post
+from litestar import Litestar, Request, delete, get, post
 from litestar.exceptions import HTTPException
 from litestar.status_codes import HTTP_401_UNAUTHORIZED, HTTP_403_FORBIDDEN
 from passlib.context import CryptContext
@@ -30,6 +30,26 @@ CREATE TABLE IF NOT EXISTS jobs (
     created_by text NOT NULL,
     created_at timestamptz NOT NULL
 );
+CREATE TABLE IF NOT EXISTS prefixes (
+    id serial PRIMARY KEY,
+    prefix text NOT NULL UNIQUE,
+    created_by text NOT NULL,
+    created_at timestamptz NOT NULL
+);
+CREATE TABLE IF NOT EXISTS prefix_events (
+    id serial PRIMARY KEY,
+    action text NOT NULL,
+    prefix text NOT NULL,
+    actor text NOT NULL,
+    created_at timestamptz NOT NULL
+);
+CREATE TABLE IF NOT EXISTS rejections (
+    id serial PRIMARY KEY,
+    lamp text NOT NULL,
+    reason text NOT NULL,
+    created_by text NOT NULL,
+    created_at timestamptz NOT NULL
+);
 """
 
 
@@ -46,6 +66,10 @@ class JobIn(BaseModel):
     lamp: str
     nominal_nm: float
     measured_nm: float
+
+
+class PrefixIn(BaseModel):
+    prefix: str
 
 
 def user_from_request(request: Request) -> dict:
@@ -111,24 +135,109 @@ async def create_job(request: Request, data: JobIn) -> dict:
     user = user_from_request(request)
     if user["role"] != "writer":
         raise HTTPException(status_code=HTTP_403_FORBIDDEN, detail="仅校准员可提交")
+    lamp = data.lamp.strip()
+    now = datetime.now(timezone.utc)
     with connect() as conn:
+        prefixes = [r["prefix"] for r in conn.execute("SELECT prefix FROM prefixes ORDER BY id").fetchall()]
+        if not any(lamp.startswith(p) for p in prefixes):
+            reason = "称呼须以合法前缀开头（当前簿：" + ("、".join(prefixes) if prefixes else "空") + "）"
+            conn.execute(
+                "INSERT INTO rejections(lamp, reason, created_by, created_at) VALUES (%s,%s,%s,%s)",
+                (lamp, reason, user["username"], now),
+            )
+            conn.commit()
+            raise HTTPException(status_code=400, detail=reason)
         row = conn.execute(
             """
             INSERT INTO jobs(lamp, nominal_nm, measured_nm, status, verdict, reason, created_by, created_at)
             VALUES (%s,%s,%s,'pending','','',%s,%s) RETURNING id
             """,
-            (data.lamp.strip(), data.nominal_nm, data.measured_nm, user["username"], datetime.now(timezone.utc)),
+            (lamp, data.nominal_nm, data.measured_nm, user["username"], now),
         ).fetchone()
         conn.commit()
         return {"id": row["id"], "status": "pending"}
 
 
+@get("/api/prefixes")
+async def list_prefixes(request: Request) -> list:
+    user_from_request(request)
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT id, prefix, created_by, created_at FROM prefixes ORDER BY id"
+        ).fetchall()
+        return list(rows)
+
+
+@post("/api/prefixes")
+async def add_prefix(request: Request, data: PrefixIn) -> dict:
+    user = user_from_request(request)
+    if user["role"] != "writer":
+        raise HTTPException(status_code=HTTP_403_FORBIDDEN, detail="仅校准员可维护前缀簿")
+    prefix = data.prefix.strip()
+    if not prefix:
+        raise HTTPException(status_code=400, detail="前缀不能为空")
+    now = datetime.now(timezone.utc)
+    with connect() as conn:
+        exists = conn.execute("SELECT 1 FROM prefixes WHERE prefix = %s", (prefix,)).fetchone()
+        if exists:
+            raise HTTPException(status_code=400, detail="前缀已存在")
+        row = conn.execute(
+            "INSERT INTO prefixes(prefix, created_by, created_at) VALUES (%s,%s,%s) RETURNING id",
+            (prefix, user["username"], now),
+        ).fetchone()
+        conn.execute(
+            "INSERT INTO prefix_events(action, prefix, actor, created_at) VALUES ('add',%s,%s,%s)",
+            (prefix, user["username"], now),
+        )
+        conn.commit()
+        return {"id": row["id"], "prefix": prefix}
+
+
+@delete("/api/prefixes/{prefix_id:int}", status_code=200)
+async def remove_prefix(request: Request, prefix_id: int) -> dict:
+    user = user_from_request(request)
+    if user["role"] != "writer":
+        raise HTTPException(status_code=HTTP_403_FORBIDDEN, detail="仅校准员可维护前缀簿")
+    now = datetime.now(timezone.utc)
+    with connect() as conn:
+        row = conn.execute("SELECT id, prefix FROM prefixes WHERE id = %s", (prefix_id,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="前缀不存在")
+        conn.execute("DELETE FROM prefixes WHERE id = %s", (prefix_id,))
+        conn.execute(
+            "INSERT INTO prefix_events(action, prefix, actor, created_at) VALUES ('remove',%s,%s,%s)",
+            (row["prefix"], user["username"], now),
+        )
+        conn.commit()
+        return {"removed": row["prefix"]}
+
+
+@get("/api/prefix-events")
+async def list_prefix_events(request: Request) -> list:
+    user_from_request(request)
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT id, action, prefix, actor, created_at FROM prefix_events ORDER BY id DESC"
+        ).fetchall()
+        return list(rows)
+
+
+@get("/api/rejections")
+async def list_rejections(request: Request) -> list:
+    user_from_request(request)
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT id, lamp, reason, created_by, created_at FROM rejections ORDER BY id DESC"
+        ).fetchall()
+        return list(rows)
+
+
 def on_startup() -> None:
     with connect() as conn:
         conn.execute(SCHEMA)
+        now = datetime.now(timezone.utc)
         n = conn.execute("SELECT COUNT(*) AS n FROM jobs").fetchone()["n"]
         if n == 0:
-            now = datetime.now(timezone.utc)
             conn.execute(
                 """
                 INSERT INTO jobs(lamp, nominal_nm, measured_nm, status, verdict, reason, created_by, created_at)
@@ -138,7 +247,31 @@ def on_startup() -> None:
                 """,
                 (now, now),
             )
+        p = conn.execute("SELECT COUNT(*) AS n FROM prefixes").fetchone()["n"]
+        if p == 0:
+            conn.execute(
+                "INSERT INTO prefixes(prefix, created_by, created_at) VALUES ('氦', 'seed', %s)",
+                (now,),
+            )
+            conn.execute(
+                "INSERT INTO prefix_events(action, prefix, actor, created_at) VALUES ('add', '氦', 'seed', %s)",
+                (now,),
+            )
         conn.commit()
 
 
-app = Litestar(route_handlers=[health, login, list_jobs, get_job, create_job], on_startup=[on_startup])
+app = Litestar(
+    route_handlers=[
+        health,
+        login,
+        list_jobs,
+        get_job,
+        create_job,
+        list_prefixes,
+        add_prefix,
+        remove_prefix,
+        list_prefix_events,
+        list_rejections,
+    ],
+    on_startup=[on_startup],
+)
